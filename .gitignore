@@ -20,3 +20,8 @@ assets/igit.bash
 *.synctex.gz
 *.toc
 *.xdv
+
+# Apache module development
+.libs/
+*.so
+*.o

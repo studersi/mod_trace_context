@@ -1,0 +1,19 @@
+services:
+  httpbin:
+    container_name: httpbin-mod_trace_context
+    image: kennethreitz/httpbin:latest
+    ports:
+      - "7999:80"
+
+  apache-trace-context:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: apache-mod_trace_context
+    image: apache-mod_trace_context:latest
+    depends_on:
+      - httpbin
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./examples/trace-default-proxy.httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
