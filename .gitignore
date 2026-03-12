@@ -1,0 +1,22 @@
+# IDE
+.idea/
+.obsidian/
+
+# tmp
+out/
+tmp/
+target/
+assets/igit.bash
+
+# LaTeX
+*.aux
+*.fdb_latexmk
+*.fls
+*.log
+*.nav
+*.out
+*.pdf
+*.snm
+*.synctex.gz
+*.toc
+*.xdv
