@@ -86,27 +86,61 @@ Configuration
 * Module: `mod_trace_context`
 
 
+### TraceContextReplaceUniqueID
 
-Log Format
-----------
+* Description: `Controls whether and how UNIQUE_ID is replaced with trace context values before tracestate is built.`
+* Syntax: `TraceContextReplaceUniqueID off|on|trace-id|parent-id|both`
+* Default: `TraceContextReplaceUniqueID off`
+* Notes: `on` is equivalent to `both` (trace-id and parent-id combination).
+* Context: `server config`, `virtual host`, `directory`, `.htaccess`
+* Status: `Extension`
+* Module: `mod_trace_context`
 
-The module provides the following log format directives:
 
-| Directive             | Description          |
-|-----------------------|----------------------|
-| `%{trace-id}^TC`      | Trace ID             |
-| `%{parent-id}^TC`     | Parent ID            |
-| `%{traceparent}^TC`   | Traceparent header   |
-| `%{tracestate}^TC`    | Tracestate header    |
-| `%{sampled}^TC`       | Sampling flag        |
 
-Request note:
+Environment variables
+---------------------
+
+
+### tc-trace-id
+
+* `tc-trace-id`: set to the resulting trace ID for the request.
+
+
+### tc-parent-id
+
+* `tc-parent-id`: set to the resulting parent ID for the request.
+
+
+### tc-traceparent
+
+* `tc-traceparent`: set to the resulting `traceparent` header value for the request.
+
+
+### tc-tracestate
+
+* `tc-tracestate`: set to the resulting `tracestate` header value for the request.
+
+
+### tc-sampled
 
 * `tc-sampled`: set to `1` for requests where the resulting trace context has the sampled flag set.
 
+
+### UNIQUE_ID_ORIG
+
+* `UNIQUE_ID_ORIG`: set to the original incoming `UNIQUE_ID` value before `TraceContextReplaceUniqueID` applies any replacement.
+* If no original `UNIQUE_ID` is available for a request, `UNIQUE_ID_ORIG` is not set.
+
 ```apache2
-LogFormat "%h %l %u %t \"%r\" %>s %b unique_id=%{UNIQUE_ID}e trace=%{trace-id}^TC parent=%{parent-id}^TC sampled=%{sampled}^TC" trace-context
+LogFormat "%h %l %u %t \"%r\" %>s %b unique_id=%{UNIQUE_ID}e unique_id_orig=%{UNIQUE_ID_ORIG}e trace=%{tc-trace-id}e parent=%{tc-parent-id}e sampled=%{tc-sampled}e traceparent=\"%{tc-traceparent}e\" tracestate=\"%{tc-tracestate}e\"" trace-context
 CustomLog logs/access.log trace-context
+
+RequestHeader set X-TC-Trace-ID %{tc-trace-id}e
+RequestHeader set X-TC-Parent-ID %{tc-parent-id}e
+RequestHeader set X-TC-Sampled %{tc-sampled}e
+RequestHeader set X-Unique-ID %{UNIQUE_ID}e
+RequestHeader set X-Unique-ID-Orig %{UNIQUE_ID_ORIG}e
 ```
 
 
@@ -121,17 +155,13 @@ Build and run development environment consisting of an httpbin backend and an Ap
 docker compose build && docker compose up -d && docker compose logs -f
 ```
 
-```bash
-docker compose restart && docker compose logs -f
-```
-
 Open httpbin through the proxy:
 
 ```bash
-curl -vqs http://localhost:8080/headers
+curl -vks https://localhost:8443/headers
 ```
 ```bash
-watch -n 1 "curl -vqs http://localhost:8080/headers 2>&1 | grep -i trace"
+watch -n 1 "curl -vks https://localhost:8443/headers 2>&1 | grep -i trace"
 ```
 
 Tear down development environment:

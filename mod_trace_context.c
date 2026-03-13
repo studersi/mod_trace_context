@@ -1,17 +1,6 @@
-/* Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+/*
+ * Copyright 2026 Your Name
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <string.h>
@@ -19,7 +8,6 @@
 
 #include "apr_general.h"
 #include "apr_lib.h"
-#include "apr_optional.h"
 #include "apr_strings.h"
 #include "apr_tables.h"
 
@@ -29,7 +17,6 @@
 #include "http_log.h"
 #include "http_protocol.h"
 #include "http_request.h"
-#include "mod_log_config.h"
 
 module AP_MODULE_DECLARE_DATA trace_context_module;
 
@@ -41,17 +28,28 @@ module AP_MODULE_DECLARE_DATA trace_context_module;
 #define TRACE_CONTEXT_TRACESTATE_MAX_LEN 512
 #define TRACE_CONTEXT_TRACESTATE_MAX_MEMBERS 32
 #define TRACE_CONTEXT_TRACESTATE_MEMBER_MAX_LEN 256
-#define TRACE_CONTEXT_TRACESTATE_MEMBER_NAME_MAX_LEN \
-    (TRACE_CONTEXT_TRACESTATE_MEMBER_MAX_LEN - 1)
+#define TRACE_CONTEXT_TRACESTATE_MEMBER_NAME_MAX_LEN (TRACE_CONTEXT_TRACESTATE_MEMBER_MAX_LEN - 1)
 #define TRACE_CONTEXT_DEFAULT_TRACESTATE_MEMBER_NAME "apache"
+#define TRACE_CONTEXT_NOTE_TRACE_ID "tc-trace-id"
+#define TRACE_CONTEXT_NOTE_PARENT_ID "tc-parent-id"
+#define TRACE_CONTEXT_NOTE_TRACEPARENT "tc-traceparent"
+#define TRACE_CONTEXT_NOTE_TRACESTATE "tc-tracestate"
 #define TRACE_CONTEXT_NOTE_SAMPLED "tc-sampled"
+#define TRACE_CONTEXT_ENV_UNIQUE_ID "UNIQUE_ID"
+#define TRACE_CONTEXT_ENV_UNIQUE_ID_ORIG "UNIQUE_ID_ORIG"
 
 enum trace_context_header_mask {
     TRACE_CONTEXT_HEADER_NONE = 0,
     TRACE_CONTEXT_HEADER_TRACEPARENT = 1 << 0,
     TRACE_CONTEXT_HEADER_TRACESTATE = 1 << 1,
-    TRACE_CONTEXT_HEADER_BOTH = TRACE_CONTEXT_HEADER_TRACEPARENT |
-                                TRACE_CONTEXT_HEADER_TRACESTATE
+    TRACE_CONTEXT_HEADER_BOTH = TRACE_CONTEXT_HEADER_TRACEPARENT | TRACE_CONTEXT_HEADER_TRACESTATE
+};
+
+enum trace_context_replace_unique_id_mode {
+    TRACE_CONTEXT_REPLACE_UNIQUE_ID_OFF = 0,
+    TRACE_CONTEXT_REPLACE_UNIQUE_ID_TRACE_ID,
+    TRACE_CONTEXT_REPLACE_UNIQUE_ID_PARENT_ID,
+    TRACE_CONTEXT_REPLACE_UNIQUE_ID_BOTH
 };
 
 typedef struct trace_context_dir_conf_t {
@@ -78,6 +76,9 @@ typedef struct trace_context_dir_conf_t {
 
     const char *tracestate_member_name;
     int tracestate_member_name_set;
+
+    int replace_unique_id;
+    int replace_unique_id_set;
 } trace_context_dir_conf_t;
 
 typedef struct trace_context_request_ctx_t {
@@ -87,8 +88,6 @@ typedef struct trace_context_request_ctx_t {
     const char *traceparent;
     const char *tracestate;
 } trace_context_request_ctx_t;
-
-static const char trace_context_log_dash[] = "-";
 
 /* Create per-directory configuration with module defaults. */
 static void *trace_context_create_dir_config(apr_pool_t *p, char *dir)
@@ -121,6 +120,9 @@ static void *trace_context_create_dir_config(apr_pool_t *p, char *dir)
     conf->tracestate_member_name = TRACE_CONTEXT_DEFAULT_TRACESTATE_MEMBER_NAME;
     conf->tracestate_member_name_set = 0;
 
+    conf->replace_unique_id = TRACE_CONTEXT_REPLACE_UNIQUE_ID_OFF;
+    conf->replace_unique_id_set = 0;
+
     return conf;
 }
 
@@ -137,13 +139,11 @@ static void *trace_context_merge_dir_config(apr_pool_t *p, void *basev,
 
     conf->request_headers = add->request_headers_set ? add->request_headers
                                                      : base->request_headers;
-    conf->request_headers_set = add->request_headers_set ||
-                                base->request_headers_set;
+    conf->request_headers_set = add->request_headers_set || base->request_headers_set;
 
     conf->response_headers = add->response_headers_set ? add->response_headers
                                                        : base->response_headers;
-    conf->response_headers_set = add->response_headers_set ||
-                                 base->response_headers_set;
+    conf->response_headers_set = add->response_headers_set || base->response_headers_set;
 
     conf->sample = add->sample_set ? add->sample : base->sample;
     conf->sample_all = add->sample_set ? add->sample_all : base->sample_all;
@@ -161,14 +161,17 @@ static void *trace_context_merge_dir_config(apr_pool_t *p, void *basev,
     conf->continue_trace_allow_all = add->continue_trace_allow_set
                                          ? add->continue_trace_allow_all
                                          : base->continue_trace_allow_all;
-    conf->continue_trace_allow_set = add->continue_trace_allow_set ||
-                                     base->continue_trace_allow_set;
+    conf->continue_trace_allow_set = add->continue_trace_allow_set || base->continue_trace_allow_set;
 
     conf->tracestate_member_name = add->tracestate_member_name_set
                                        ? add->tracestate_member_name
                                        : base->tracestate_member_name;
-    conf->tracestate_member_name_set = add->tracestate_member_name_set ||
-                                       base->tracestate_member_name_set;
+    conf->tracestate_member_name_set = add->tracestate_member_name_set || base->tracestate_member_name_set;
+
+    conf->replace_unique_id = add->replace_unique_id_set
+                                  ? add->replace_unique_id
+                                  : base->replace_unique_id;
+    conf->replace_unique_id_set = add->replace_unique_id_set || base->replace_unique_id_set;
 
     return conf;
 }
@@ -352,31 +355,34 @@ static int trace_context_is_tracestate_member_name_char(unsigned char ch)
            ch == '-' || ch == '*' || ch == '/';
 }
 
-/* Validate a configured tracestate member key. */
-static int trace_context_is_valid_tracestate_member_name(const char *name)
+/* Validate tracestate member key grammar for a bounded key token. */
+static int trace_context_is_valid_tracestate_member_name_range(const char *name,
+                                                               apr_size_t name_len)
 {
     const char *at;
-    const char *cursor;
-    apr_size_t name_len;
+    apr_size_t i;
 
-    if (name == NULL || name[0] == '\0') {
+    if (name == NULL || name_len == 0) {
         return 0;
     }
 
-    name_len = strlen(name);
-    if (name_len == 0 ||
-        name_len > TRACE_CONTEXT_TRACESTATE_MEMBER_NAME_MAX_LEN) {
+    if (name_len > TRACE_CONTEXT_TRACESTATE_MEMBER_NAME_MAX_LEN) {
         return 0;
     }
 
-    at = strchr(name, '@');
+    at = NULL;
+    for (i = 0; i < name_len; ++i) {
+        if (name[i] == '@') {
+            if (at != NULL) {
+                return 0;
+            }
+            at = name + i;
+        }
+    }
+
     if (at != NULL) {
         apr_size_t tenant_len;
         apr_size_t system_len;
-
-        if (strchr(at + 1, '@') != NULL) {
-            return 0;
-        }
 
         tenant_len = (apr_size_t)(at - name);
         system_len = name_len - tenant_len - 1;
@@ -386,20 +392,61 @@ static int trace_context_is_valid_tracestate_member_name(const char *name)
         }
     }
 
-    cursor = name;
-    if (*cursor < 'a' || *cursor > 'z') {
+    if (name[0] < 'a' || name[0] > 'z') {
         return 0;
     }
 
-    for (++cursor; *cursor != '\0'; ++cursor) {
-        if (*cursor == '@') {
-            if (cursor[1] < 'a' || cursor[1] > 'z') {
+    for (i = 1; i < name_len; ++i) {
+        unsigned char ch = (unsigned char)name[i];
+
+        if (ch == '@') {
+            if ((i + 1) >= name_len || name[i + 1] < 'a' || name[i + 1] > 'z') {
                 return 0;
             }
             continue;
         }
 
-        if (!trace_context_is_tracestate_member_name_char((unsigned char)*cursor)) {
+        if (!trace_context_is_tracestate_member_name_char(ch)) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* Validate a configured tracestate member key. */
+static int trace_context_is_valid_tracestate_member_name(const char *name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+
+    return trace_context_is_valid_tracestate_member_name_range(name,
+                                                               strlen(name));
+}
+
+/* Return non-zero if a character is valid in a tracestate value. */
+static int trace_context_is_tracestate_member_value_char(unsigned char ch)
+{
+    return ch >= 0x20 && ch <= 0x7e && ch != ',' && ch != '=';
+}
+
+/* Validate tracestate member value grammar for a bounded value token. */
+static int trace_context_is_valid_tracestate_member_value(const char *value,
+                                                          apr_size_t value_len)
+{
+    apr_size_t i;
+
+    if (value == NULL || value_len == 0) {
+        return 0;
+    }
+
+    if (value[0] == ' ' || value[value_len - 1] == ' ') {
+        return 0;
+    }
+
+    for (i = 0; i < value_len; ++i) {
+        if (!trace_context_is_tracestate_member_value_char((unsigned char)value[i])) {
             return 0;
         }
     }
@@ -422,11 +469,7 @@ static const char *trace_context_build_tracestate_member(apr_pool_t *p,
         member_value_len = member_value_max_len;
     }
 
-    return apr_pstrcat(p,
-                       member_name,
-                       "=",
-                       apr_pstrndup(p, member_value, member_value_len),
-                       NULL);
+    return apr_pstrcat(p, member_name, "=", apr_pstrndup(p, member_value, member_value_len), NULL);
 }
 
 /* Check whether another tracestate member can be appended within limits. */
@@ -449,6 +492,60 @@ static int trace_context_can_append_tracestate_member(apr_size_t current_len,
     return current_len + 1 + member_len <= TRACE_CONTEXT_TRACESTATE_MAX_LEN;
 }
 
+/* Locate tracestate key and value bounds inside a `key=value` member. */
+static int trace_context_tracestate_member_bounds(const char *member_start,
+                                                  const char *member_end,
+                                                  const char **key_start,
+                                                  const char **key_end,
+                                                  const char **value_start,
+                                                  const char **value_end)
+{
+    const char *equals;
+
+    equals = memchr(member_start,
+                    '=',
+                    (apr_size_t)(member_end - member_start));
+    if (equals == NULL || equals == member_start || (equals + 1) == member_end) {
+        return 0;
+    }
+
+    *key_start = member_start;
+    *key_end = equals;
+    *value_start = equals + 1;
+    *value_end = member_end;
+
+    return 1;
+}
+
+/* Return non-zero when the tracestate key already exists in the output list. */
+static int trace_context_tracestate_has_member_key(const apr_array_header_t *keys,
+                                                   const char *key,
+                                                   apr_size_t key_len)
+{
+    const char *const *elts = (const char *const *)keys->elts;
+    int i;
+
+    for (i = 0; i < keys->nelts; ++i) {
+        const char *existing_key = elts[i];
+
+        if (strlen(existing_key) == key_len &&
+            strncmp(existing_key, key, key_len) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* Remember a tracestate member key for duplicate suppression. */
+static void trace_context_tracestate_add_member_key(apr_pool_t *p,
+                                                    apr_array_header_t *keys,
+                                                    const char *key,
+                                                    apr_size_t key_len)
+{
+    *(const char **)apr_array_push(keys) = apr_pstrndup(p, key, key_len);
+}
+
 /* Ensure the module's tracestate member is prepended and preserve valid peers. */
 static const char *trace_context_ensure_apache_tracestate(apr_pool_t *p,
                                                           const char *tracestate,
@@ -457,6 +554,7 @@ static const char *trace_context_ensure_apache_tracestate(apr_pool_t *p,
 {
     const char *apache_member;
     apr_array_header_t *members;
+    apr_array_header_t *member_keys;
     const char *cursor;
     apr_size_t tracestate_len;
     apr_size_t member_count;
@@ -471,12 +569,20 @@ static const char *trace_context_ensure_apache_tracestate(apr_pool_t *p,
     }
 
     members = apr_array_make(p, 4, sizeof(const char *));
+    member_keys = apr_array_make(p, 4, sizeof(const char *));
+    trace_context_tracestate_add_member_key(p, member_keys, member_name, strlen(member_name));
     cursor = tracestate;
 
     while (*cursor != '\0') {
         const char *member_start;
         const char *member_end;
+        const char *key_start;
+        const char *key_end;
+        const char *value_start;
+        const char *value_end;
         apr_size_t member_len;
+        apr_size_t key_len;
+        apr_size_t value_len;
 
         while (trace_context_is_ows(*cursor)) {
             ++cursor;
@@ -493,12 +599,39 @@ static const char *trace_context_ensure_apache_tracestate(apr_pool_t *p,
         }
 
         member_len = (apr_size_t)(member_end - member_start);
-        if (member_len > 0 &&
-            trace_context_can_append_tracestate_member(tracestate_len,
-                                                       member_count,
-                                                       member_len)) {
+        if (!trace_context_tracestate_member_bounds(member_start,
+                                                    member_end,
+                                                    &key_start,
+                                                    &key_end,
+                                                    &value_start,
+                                                    &value_end)) {
+            if (*cursor == ',') {
+                ++cursor;
+            }
+            continue;
+        }
+
+        key_len = (apr_size_t)(key_end - key_start);
+        value_len = (apr_size_t)(value_end - value_start);
+        if (!trace_context_is_valid_tracestate_member_name_range(key_start, key_len) ||
+            !trace_context_is_valid_tracestate_member_value(value_start, value_len)) {
+            if (*cursor == ',') {
+                ++cursor;
+            }
+            continue;
+        }
+
+        if (trace_context_tracestate_has_member_key(member_keys, key_start, key_len)) {
+            if (*cursor == ',') {
+                ++cursor;
+            }
+            continue;
+        }
+
+        if (member_len > 0 && trace_context_can_append_tracestate_member(tracestate_len, member_count, member_len)) {
             *(const char **)apr_array_push(members) =
                 apr_pstrndup(p, member_start, member_len);
+            trace_context_tracestate_add_member_key(p, member_keys, key_start, key_len);
             tracestate_len += 1 + member_len;
             ++member_count;
         }
@@ -543,6 +676,68 @@ static const char *trace_context_parse_header_mode(const char *value, int *mode)
     return "value must be one of: none, traceparent, tracestate, both";
 }
 
+/* Parse UNIQUE_ID replacement mode. */
+static const char *trace_context_parse_replace_unique_id_mode(const char *value,
+                                                              int *mode)
+{
+    if (value == NULL) {
+        return "value must be one of: off, on, trace-id, parent-id, both";
+    }
+
+    if (!strcasecmp(value, "off")) {
+        *mode = TRACE_CONTEXT_REPLACE_UNIQUE_ID_OFF;
+        return NULL;
+    }
+    if (!strcasecmp(value, "on") || !strcasecmp(value, "both")) {
+        *mode = TRACE_CONTEXT_REPLACE_UNIQUE_ID_BOTH;
+        return NULL;
+    }
+    if (!strcasecmp(value, "trace-id")) {
+        *mode = TRACE_CONTEXT_REPLACE_UNIQUE_ID_TRACE_ID;
+        return NULL;
+    }
+    if (!strcasecmp(value, "parent-id")) {
+        *mode = TRACE_CONTEXT_REPLACE_UNIQUE_ID_PARENT_ID;
+        return NULL;
+    }
+
+    return "value must be one of: off, on, trace-id, parent-id, both";
+}
+
+/* Convert request/response header mode bitmask to human-readable name. */
+static const char *trace_context_header_mode_name(int mode)
+{
+    switch (mode) {
+    case TRACE_CONTEXT_HEADER_NONE:
+        return "none";
+    case TRACE_CONTEXT_HEADER_TRACEPARENT:
+        return "traceparent";
+    case TRACE_CONTEXT_HEADER_TRACESTATE:
+        return "tracestate";
+    case TRACE_CONTEXT_HEADER_BOTH:
+        return "both";
+    default:
+        return "unknown";
+    }
+}
+
+/* Convert UNIQUE_ID replacement mode to human-readable name. */
+static const char *trace_context_replace_unique_id_mode_name(int mode)
+{
+    switch (mode) {
+    case TRACE_CONTEXT_REPLACE_UNIQUE_ID_OFF:
+        return "off";
+    case TRACE_CONTEXT_REPLACE_UNIQUE_ID_TRACE_ID:
+        return "trace-id";
+    case TRACE_CONTEXT_REPLACE_UNIQUE_ID_PARENT_ID:
+        return "parent-id";
+    case TRACE_CONTEXT_REPLACE_UNIQUE_ID_BOTH:
+        return "both";
+    default:
+        return "unknown";
+    }
+}
+
 /* Evaluate whether incoming sampled traces are allowed to remain sampled. */
 static int trace_context_is_sampling_allowed(request_rec *r,
                                              const trace_context_dir_conf_t *conf)
@@ -551,19 +746,13 @@ static int trace_context_is_sampling_allowed(request_rec *r,
     int rc;
 
     if (conf->sample_allow_all) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE2,
-                      0,
-                      r,
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                       "mod_trace_context: sampling allowed by TraceContextSampleAllowExpr=all");
         return 1;
     }
 
     if (conf->sample_allow == NULL) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE2,
-                      0,
-                      r,
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                       "mod_trace_context: sampling denied (TraceContextSampleAllowExpr=none)");
         return 0;
     }
@@ -576,10 +765,7 @@ static int trace_context_is_sampling_allowed(request_rec *r,
         return 0;
     }
 
-    ap_log_rerror(APLOG_MARK,
-                  APLOG_TRACE2,
-                  0,
-                  r,
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                   "mod_trace_context: TraceContextSampleAllowExpr evaluated to %d",
                   rc ? 1 : 0);
 
@@ -594,38 +780,26 @@ static int trace_context_is_sampling_requested(request_rec *r,
     int rc;
 
     if (conf->sample_all) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE2,
-                      0,
-                      r,
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                       "mod_trace_context: sampling requested by TraceContextSampleExpr=all");
         return 1;
     }
 
     if (conf->sample == NULL) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE2,
-                      0,
-                      r,
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                       "mod_trace_context: sampling not requested (TraceContextSampleExpr=none)");
         return 0;
     }
 
     rc = ap_expr_exec(r, conf->sample, &err);
     if (err != NULL) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_WARNING,
-                      0,
-                      r,
+        ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r,
                       "mod_trace_context: failed to evaluate TraceContextSampleExpr: %s",
                       err);
         return 0;
     }
 
-    ap_log_rerror(APLOG_MARK,
-                  APLOG_TRACE2,
-                  0,
-                  r,
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                   "mod_trace_context: TraceContextSampleExpr evaluated to %d",
                   rc ? 1 : 0);
 
@@ -641,11 +815,7 @@ static int trace_context_is_trace_continuation_allowed(
     int rc;
 
     if (conf->continue_trace_allow == NULL) {
-        ap_log_rerror(
-            APLOG_MARK,
-            APLOG_TRACE2,
-            0,
-            r,
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
             "mod_trace_context: trace continuation %s (TraceContextContinueTraceAllowExpr=%s)",
             conf->continue_trace_allow_all ? "allowed" : "denied",
             conf->continue_trace_allow_all ? "all" : "none");
@@ -654,20 +824,13 @@ static int trace_context_is_trace_continuation_allowed(
 
     rc = ap_expr_exec(r, conf->continue_trace_allow, &err);
     if (err != NULL) {
-        ap_log_rerror(
-            APLOG_MARK,
-            APLOG_WARNING,
-            0,
-            r,
+        ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r,
             "mod_trace_context: failed to evaluate TraceContextContinueTraceAllowExpr: %s",
             err);
         return 0;
     }
 
-    ap_log_rerror(APLOG_MARK,
-                  APLOG_TRACE2,
-                  0,
-                  r,
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                   "mod_trace_context: TraceContextContinueTraceAllowExpr evaluated to %d",
                   rc ? 1 : 0);
 
@@ -681,9 +844,22 @@ static trace_context_request_ctx_t *trace_context_get_parent_ctx(request_rec *r)
 
     if (r->main != NULL) {
         ctx = ap_get_module_config(r->main->request_config, &trace_context_module);
+        if (ctx != NULL) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "mod_trace_context: found parent context on r->main");
+        }
     }
     if (ctx == NULL && r->prev != NULL) {
         ctx = ap_get_module_config(r->prev->request_config, &trace_context_module);
+        if (ctx != NULL) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "mod_trace_context: found parent context on r->prev");
+        }
+    }
+
+    if (ctx == NULL && (r->main != NULL || r->prev != NULL)) {
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                      "mod_trace_context: no parent context found on parent request chain");
     }
 
     return ctx;
@@ -709,46 +885,55 @@ static int trace_context_init_new_ctx(request_rec *r,
     const char *traceparent = apr_table_get(r->headers_in, "traceparent");
     const char *tracestate = apr_table_get(r->headers_in, "tracestate");
     int continue_trace = trace_context_is_trace_continuation_allowed(r, conf);
+    int has_incoming_traceparent = traceparent != NULL && traceparent[0] != '\0';
+    int parsed_traceparent = 0;
     int incoming_sampled;
     int sampling_requested;
     int sampled;
 
-    if (continue_trace &&
-        trace_context_parse_traceparent(traceparent,
-                                        ctx->trace_id,
-                                        ctx->parent_id,
-                                        &ctx->trace_flags)) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE1,
-                      0,
-                      r,
+    if (has_incoming_traceparent) {
+        parsed_traceparent = trace_context_parse_traceparent(traceparent, ctx->trace_id, ctx->parent_id, &ctx->trace_flags);
+    }
+
+    if (continue_trace && parsed_traceparent) {
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
                       "mod_trace_context: continuing incoming traceparent=%s",
                       traceparent);
         if (tracestate != NULL && tracestate[0] != '\0') {
             ctx->tracestate = apr_pstrdup(r->pool, tracestate);
-            ap_log_rerror(APLOG_MARK,
-                          APLOG_TRACE2,
-                          0,
-                          r,
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                           "mod_trace_context: accepted incoming tracestate");
+        }
+        else {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                          "mod_trace_context: no incoming tracestate to continue");
         }
     }
     else {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE1,
-                      0,
-                      r,
+        if (!continue_trace && has_incoming_traceparent) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "mod_trace_context: ignored incoming traceparent because continuation is denied");
+        }
+        else if (continue_trace && has_incoming_traceparent && !parsed_traceparent) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "mod_trace_context: ignored invalid incoming traceparent");
+        }
+        else if (!has_incoming_traceparent) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                          "mod_trace_context: no incoming traceparent provided");
+        }
+
+        if (tracestate != NULL && tracestate[0] != '\0') {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                          "mod_trace_context: ignoring incoming tracestate because a new trace is started");
+        }
+
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
                       "mod_trace_context: starting new trace (continuation=%d, traceparent_valid=%d)",
                       continue_trace,
-                      trace_context_parse_traceparent(traceparent,
-                                                      ctx->trace_id,
-                                                      ctx->parent_id,
-                                                      &ctx->trace_flags));
+                      parsed_traceparent);
         if (!trace_context_random_trace_id(ctx->trace_id)) {
-            ap_log_rerror(APLOG_MARK,
-                          APLOG_ERR,
-                          0,
-                          r,
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                           "mod_trace_context: failed to generate secure trace id");
             return HTTP_INTERNAL_SERVER_ERROR;
         }
@@ -756,10 +941,7 @@ static int trace_context_init_new_ctx(request_rec *r,
     }
 
     if (!trace_context_random_parent_id(ctx->parent_id)) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_ERR,
-                      0,
-                      r,
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                       "mod_trace_context: failed to generate secure parent id");
         return HTTP_INTERNAL_SERVER_ERROR;
     }
@@ -770,17 +952,11 @@ static int trace_context_init_new_ctx(request_rec *r,
 
     if (incoming_sampled) {
         if (trace_context_is_sampling_allowed(r, conf)) {
-            ap_log_rerror(APLOG_MARK,
-                          APLOG_TRACE2,
-                          0,
-                          r,
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                           "mod_trace_context: kept incoming sampled flag (TraceContextSampleAllowExpr matched)");
         }
         else {
-            ap_log_rerror(APLOG_MARK,
-                          APLOG_TRACE2,
-                          0,
-                          r,
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                           "mod_trace_context: removed incoming sampled flag (TraceContextSampleAllowExpr denied)");
             sampled = 0;
         }
@@ -790,6 +966,12 @@ static int trace_context_init_new_ctx(request_rec *r,
         sampled = 1;
     }
 
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                  "mod_trace_context: sampling decision incoming=%d requested=%d final=%d",
+                  incoming_sampled,
+                  sampling_requested,
+                  sampled);
+
     if (sampled) {
         ctx->trace_flags |= TRACE_CONTEXT_TRACE_FLAG_SAMPLED;
     }
@@ -797,15 +979,12 @@ static int trace_context_init_new_ctx(request_rec *r,
         ctx->trace_flags &= ~TRACE_CONTEXT_TRACE_FLAG_SAMPLED;
     }
 
-    ctx->traceparent = trace_context_build_traceparent(r->pool,
-                                                       ctx->trace_id,
-                                                       ctx->parent_id,
-                                                       ctx->trace_flags);
+    ctx->traceparent = trace_context_build_traceparent(r->pool, ctx->trace_id, ctx->parent_id, ctx->trace_flags);
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                  "mod_trace_context: built traceparent=%s",
+                  ctx->traceparent);
 
-    ap_log_rerror(APLOG_MARK,
-                  APLOG_DEBUG,
-                  0,
-                  r,
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
                   "mod_trace_context: initialized context trace_id=%s parent_id=%s sampled=%d",
                   ctx->trace_id,
                   ctx->parent_id,
@@ -819,60 +998,188 @@ static void trace_context_build_request_tracestate(request_rec *r,
                                                    const trace_context_dir_conf_t *conf,
                                                    trace_context_request_ctx_t *ctx)
 {
-    const char *unique_id = apr_table_get(r->subprocess_env, "UNIQUE_ID");
+    const char *unique_id = apr_table_get(r->subprocess_env,
+                                          TRACE_CONTEXT_ENV_UNIQUE_ID);
+    const char *original_unique_id = unique_id;
+    const char *replacement_unique_id = NULL;
 
-    if (unique_id == NULL || unique_id[0] == '\0') {
-        unique_id = apr_psprintf(r->pool, "%s-%s", ctx->trace_id, ctx->parent_id);
-        apr_table_setn(r->subprocess_env, "UNIQUE_ID", unique_id);
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE2,
-                      0,
-                      r,
-                      "mod_trace_context: generated fallback UNIQUE_ID for tracestate");
+    if (original_unique_id != NULL) {
+        apr_table_setn(r->subprocess_env,
+                       TRACE_CONTEXT_ENV_UNIQUE_ID_ORIG,
+                       original_unique_id);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                      "mod_trace_context: preserved original %s as %s",
+                      TRACE_CONTEXT_ENV_UNIQUE_ID,
+                      TRACE_CONTEXT_ENV_UNIQUE_ID_ORIG);
+    }
+    else {
+        apr_table_unset(r->subprocess_env, TRACE_CONTEXT_ENV_UNIQUE_ID_ORIG);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: no %s present in subprocess_env",
+                      TRACE_CONTEXT_ENV_UNIQUE_ID);
+    }
+
+    switch (conf->replace_unique_id) {
+    case TRACE_CONTEXT_REPLACE_UNIQUE_ID_TRACE_ID:
+        replacement_unique_id = ctx->trace_id;
+        break;
+    case TRACE_CONTEXT_REPLACE_UNIQUE_ID_PARENT_ID:
+        replacement_unique_id = ctx->parent_id;
+        break;
+    case TRACE_CONTEXT_REPLACE_UNIQUE_ID_BOTH:
+        replacement_unique_id = apr_psprintf(r->pool,
+                                             "%s-%s",
+                                             ctx->trace_id,
+                                             ctx->parent_id);
+        break;
+    case TRACE_CONTEXT_REPLACE_UNIQUE_ID_OFF:
+    default:
+        break;
+    }
+
+    if (replacement_unique_id != NULL) {
+        unique_id = replacement_unique_id;
+        apr_table_setn(r->subprocess_env, TRACE_CONTEXT_ENV_UNIQUE_ID, unique_id);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                      "mod_trace_context: replaced UNIQUE_ID for tracestate (mode=%s)",
+                      trace_context_replace_unique_id_mode_name(conf->replace_unique_id));
+    }
+    else {
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                      "mod_trace_context: kept original UNIQUE_ID for tracestate (mode=%s)",
+                      trace_context_replace_unique_id_mode_name(conf->replace_unique_id));
     }
 
     ctx->tracestate = trace_context_ensure_apache_tracestate(r->pool,
                                                               ctx->tracestate,
                                                               conf->tracestate_member_name,
                                                               unique_id);
-    ap_log_rerror(APLOG_MARK,
-                  APLOG_TRACE2,
-                  0,
-                  r,
-                  "mod_trace_context: built tracestate with member '%s'",
-                  conf->tracestate_member_name);
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                  "mod_trace_context: built tracestate with member '%s': %s",
+                  conf->tracestate_member_name,
+                  ctx->tracestate);
 }
 
 /* Set trace headers into the provided table according to configured mode. */
-static void trace_context_set_headers(apr_table_t *headers,
+static void trace_context_set_headers(request_rec *r,
+                                      apr_table_t *headers,
                                       int header_mode,
+                                      const char *header_scope,
                                       const trace_context_request_ctx_t *ctx)
 {
     if ((header_mode & TRACE_CONTEXT_HEADER_TRACEPARENT) &&
         ctx->traceparent != NULL) {
         apr_table_setn(headers, "traceparent", ctx->traceparent);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                      "mod_trace_context: propagated %s header traceparent",
+                      header_scope);
     }
+    else if (header_mode & TRACE_CONTEXT_HEADER_TRACEPARENT) {
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                      "mod_trace_context: skipped %s header traceparent propagation (missing value)",
+                      header_scope);
+    }
+    else {
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: %s header traceparent propagation disabled",
+                      header_scope);
+    }
+
     if ((header_mode & TRACE_CONTEXT_HEADER_TRACESTATE) &&
         ctx->tracestate != NULL) {
         apr_table_setn(headers, "tracestate", ctx->tracestate);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                      "mod_trace_context: propagated %s header tracestate",
+                      header_scope);
     }
+    else if (header_mode & TRACE_CONTEXT_HEADER_TRACESTATE) {
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                      "mod_trace_context: skipped %s header tracestate propagation (missing value)",
+                      header_scope);
+    }
+    else {
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: %s header tracestate propagation disabled",
+                      header_scope);
+    }
+
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                  "mod_trace_context: %s header propagation completed (mode=%s)",
+                  header_scope,
+                  trace_context_header_mode_name(header_mode));
 }
 
-/* Mirror sampled state into a request note used by logging and other modules. */
-static void trace_context_set_sampled_note(request_rec *r,
-                                           const trace_context_request_ctx_t *ctx)
+/* Mirror trace context values into request environment variables. */
+static void trace_context_set_sampled_env_var(request_rec *r,
+                                               const trace_context_request_ctx_t *ctx)
 {
+    if (ctx->trace_id[0] != '\0') {
+        apr_table_setn(r->subprocess_env, TRACE_CONTEXT_NOTE_TRACE_ID, ctx->trace_id);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: set request env var %s=%s",
+                      TRACE_CONTEXT_NOTE_TRACE_ID,
+                      ctx->trace_id);
+    }
+    else {
+        apr_table_unset(r->subprocess_env, TRACE_CONTEXT_NOTE_TRACE_ID);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: unset request env var %s",
+                      TRACE_CONTEXT_NOTE_TRACE_ID);
+    }
+
+    if (ctx->parent_id[0] != '\0') {
+        apr_table_setn(r->subprocess_env, TRACE_CONTEXT_NOTE_PARENT_ID, ctx->parent_id);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: set request env var %s=%s",
+                      TRACE_CONTEXT_NOTE_PARENT_ID,
+                      ctx->parent_id);
+    }
+    else {
+        apr_table_unset(r->subprocess_env, TRACE_CONTEXT_NOTE_PARENT_ID);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: unset request env var %s",
+                      TRACE_CONTEXT_NOTE_PARENT_ID);
+    }
+
+    if (ctx->traceparent != NULL && ctx->traceparent[0] != '\0') {
+        apr_table_setn(r->subprocess_env, TRACE_CONTEXT_NOTE_TRACEPARENT, ctx->traceparent);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: set request env var %s=%s",
+                      TRACE_CONTEXT_NOTE_TRACEPARENT,
+                      ctx->traceparent);
+    }
+    else {
+        apr_table_unset(r->subprocess_env, TRACE_CONTEXT_NOTE_TRACEPARENT);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: unset request env var %s",
+                      TRACE_CONTEXT_NOTE_TRACEPARENT);
+    }
+
+    if (ctx->tracestate != NULL && ctx->tracestate[0] != '\0') {
+        apr_table_setn(r->subprocess_env, TRACE_CONTEXT_NOTE_TRACESTATE, ctx->tracestate);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: set request env var %s=%s",
+                      TRACE_CONTEXT_NOTE_TRACESTATE,
+                      ctx->tracestate);
+    }
+    else {
+        apr_table_unset(r->subprocess_env, TRACE_CONTEXT_NOTE_TRACESTATE);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE4, 0, r,
+                      "mod_trace_context: unset request env var %s",
+                      TRACE_CONTEXT_NOTE_TRACESTATE);
+    }
+
     if ((ctx->trace_flags & TRACE_CONTEXT_TRACE_FLAG_SAMPLED) != 0) {
-        apr_table_setn(r->notes, TRACE_CONTEXT_NOTE_SAMPLED, "1");
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE2,
-                      0,
-                      r,
-                      "mod_trace_context: set request note %s=1",
+        apr_table_setn(r->subprocess_env, TRACE_CONTEXT_NOTE_SAMPLED, "1");
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                      "mod_trace_context: set request env var %s=1",
                       TRACE_CONTEXT_NOTE_SAMPLED);
     }
     else {
-        apr_table_unset(r->notes, TRACE_CONTEXT_NOTE_SAMPLED);
+        apr_table_unset(r->subprocess_env, TRACE_CONTEXT_NOTE_SAMPLED);
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
+                      "mod_trace_context: unset request env var %s",
+                      TRACE_CONTEXT_NOTE_SAMPLED);
     }
 }
 
@@ -885,44 +1192,45 @@ static int trace_context_post_read_request(request_rec *r)
 
     conf = ap_get_module_config(r->per_dir_config, &trace_context_module);
     if (conf == NULL || !conf->enabled) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE3,
-                      0,
-                      r,
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
                       "mod_trace_context: skipped post_read_request (disabled)");
         return DECLINED;
     }
+
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                  "mod_trace_context: post_read_request config request_headers=%s response_headers=%s replace_unique_id=%s tracestate_member=%s",
+                  trace_context_header_mode_name(conf->request_headers),
+                  trace_context_header_mode_name(conf->response_headers),
+                  trace_context_replace_unique_id_mode_name(conf->replace_unique_id),
+                  conf->tracestate_member_name);
 
     ctx = apr_pcalloc(r->pool, sizeof(*ctx));
     ap_set_module_config(r->request_config, &trace_context_module, ctx);
 
     parent_ctx = trace_context_get_parent_ctx(r);
     if (parent_ctx != NULL) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE1,
-                      0,
-                      r,
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
                       "mod_trace_context: inherited context from parent request");
         trace_context_copy_request_ctx(r->pool, ctx, parent_ctx);
     }
     else {
         int rc = trace_context_init_new_ctx(r, conf, ctx);
         if (rc != OK) {
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "mod_trace_context: failed to initialize request context (rc=%d)",
+                          rc);
             return rc;
         }
     }
 
     trace_context_build_request_tracestate(r, conf, ctx);
-    trace_context_set_sampled_note(r, ctx);
+    trace_context_set_sampled_env_var(r, ctx);
 
-    trace_context_set_headers(r->headers_in, conf->request_headers, ctx);
+    trace_context_set_headers(r, r->headers_in, conf->request_headers, "request", ctx);
 
-    ap_log_rerror(APLOG_MARK,
-                  APLOG_TRACE1,
-                  0,
-                  r,
-                  "mod_trace_context: request headers updated (mode=%d)",
-                  conf->request_headers);
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                  "mod_trace_context: request headers updated (mode=%s)",
+                  trace_context_header_mode_name(conf->request_headers));
 
     return DECLINED;
 }
@@ -935,143 +1243,31 @@ static int trace_context_fixups(request_rec *r)
 
     conf = ap_get_module_config(r->per_dir_config, &trace_context_module);
     if (conf == NULL || !conf->enabled) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE3,
-                      0,
-                      r,
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
                       "mod_trace_context: skipped fixups (disabled)");
         return DECLINED;
     }
 
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                  "mod_trace_context: fixups config response_headers=%s",
+                  trace_context_header_mode_name(conf->response_headers));
+
     ctx = ap_get_module_config(r->request_config, &trace_context_module);
     if (ctx == NULL) {
-        ap_log_rerror(APLOG_MARK,
-                      APLOG_TRACE3,
-                      0,
-                      r,
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
                       "mod_trace_context: skipped fixups (no request context)");
         return DECLINED;
     }
 
-    trace_context_set_headers(r->err_headers_out, conf->response_headers, ctx);
+    trace_context_set_headers(r, r->err_headers_out, conf->response_headers, "response", ctx);
 
-    ap_log_rerror(APLOG_MARK,
-                  APLOG_TRACE1,
-                  0,
-                  r,
-                  "mod_trace_context: response headers updated (mode=%d)",
-                  conf->response_headers);
+    ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                  "mod_trace_context: response headers updated (mode=%s)",
+                  trace_context_header_mode_name(conf->response_headers));
 
     return DECLINED;
 }
 
-/* Retrieve this module's request context from a request record. */
-static trace_context_request_ctx_t *trace_context_get_req_ctx(request_rec *r)
-{
-    if (r == NULL) {
-        return NULL;
-    }
-
-    return ap_get_module_config(r->request_config, &trace_context_module);
-}
-
-/* Log provider for the current trace-id. */
-static const char *trace_context_log_trace_id(request_rec *r, char *a)
-{
-    trace_context_request_ctx_t *ctx = trace_context_get_req_ctx(r);
-
-    (void)a;
-
-    return ctx ? ctx->trace_id : trace_context_log_dash;
-}
-
-/* Log provider for the current parent-id. */
-static const char *trace_context_log_parent_id(request_rec *r, char *a)
-{
-    trace_context_request_ctx_t *ctx = trace_context_get_req_ctx(r);
-
-    (void)a;
-
-    return ctx ? ctx->parent_id : trace_context_log_dash;
-}
-
-/* Log provider for the full traceparent header value. */
-static const char *trace_context_log_traceparent(request_rec *r, char *a)
-{
-    trace_context_request_ctx_t *ctx = trace_context_get_req_ctx(r);
-
-    (void)a;
-
-    return (ctx != NULL && ctx->traceparent != NULL) ? ctx->traceparent
-                                                     : trace_context_log_dash;
-}
-
-/* Log provider for the tracestate header value. */
-static const char *trace_context_log_tracestate(request_rec *r, char *a)
-{
-    trace_context_request_ctx_t *ctx = trace_context_get_req_ctx(r);
-
-    (void)a;
-
-    return (ctx != NULL && ctx->tracestate != NULL) ? ctx->tracestate
-                                                    : trace_context_log_dash;
-}
-
-/* Log provider for sampled flag as `1`/`0` or `-` when unavailable. */
-static const char *trace_context_log_sampled(request_rec *r, char *a)
-{
-    trace_context_request_ctx_t *ctx = trace_context_get_req_ctx(r);
-
-    (void)a;
-
-    if (ctx == NULL) {
-        return trace_context_log_dash;
-    }
-
-    return (ctx->trace_flags & TRACE_CONTEXT_TRACE_FLAG_SAMPLED) ? "1" : "0";
-}
-
-/* Generic `%{name}^TC` log handler dispatcher. */
-static const char *trace_context_log_generic(request_rec *r, char *a)
-{
-    if (a == NULL || *a == '\0') {
-        return trace_context_log_dash;
-    }
-    if (!strcasecmp(a, "traceparent")) {
-        return trace_context_log_traceparent(r, a);
-    }
-    if (!strcasecmp(a, "trace-id")) {
-        return trace_context_log_trace_id(r, a);
-    }
-    if (!strcasecmp(a, "parent-id")) {
-        return trace_context_log_parent_id(r, a);
-    }
-    if (!strcasecmp(a, "tracestate")) {
-        return trace_context_log_tracestate(r, a);
-    }
-    if (!strcasecmp(a, "sampled")) {
-        return trace_context_log_sampled(r, a);
-    }
-
-    return trace_context_log_dash;
-}
-
-/* pre_config hook: register custom log handler tokens for trace context. */
-static int trace_context_pre_config(apr_pool_t *p, apr_pool_t *plog,
-                                    apr_pool_t *ptemp)
-{
-    APR_OPTIONAL_FN_TYPE(ap_register_log_handler) *register_log_handler;
-
-    (void)plog;
-    (void)ptemp;
-
-    register_log_handler = APR_RETRIEVE_OPTIONAL_FN(ap_register_log_handler);
-    if (register_log_handler != NULL) {
-        register_log_handler(p, "^TC", trace_context_log_generic, 0);
-    }
-
-    return OK;
-}
 
 /* Directive handler for `TraceContext` on/off flag. */
 static const char *trace_context_cmd_enabled(cmd_parms *cmd,
@@ -1264,6 +1460,26 @@ static const char *trace_context_cmd_tracestate_member_name(cmd_parms *cmd,
     return NULL;
 }
 
+/* Directive handler for `TraceContextReplaceUniqueID` mode. */
+static const char *trace_context_cmd_replace_unique_id(cmd_parms *cmd,
+                                                       void *mconfig,
+                                                       const char *arg)
+{
+    trace_context_dir_conf_t *conf = mconfig;
+    const char *err;
+
+    (void)cmd;
+
+    err = trace_context_parse_replace_unique_id_mode(arg, &conf->replace_unique_id);
+    if (err != NULL) {
+        return err;
+    }
+
+    conf->replace_unique_id_set = 1;
+
+    return NULL;
+}
+
 static const command_rec trace_context_cmds[] = {
     AP_INIT_FLAG("TraceContext",
                  trace_context_cmd_enabled,
@@ -1290,6 +1506,11 @@ static const command_rec trace_context_cmds[] = {
                   NULL,
                   OR_FILEINFO,
                   "Name used for the tracestate member key (default: apache)"),
+    AP_INIT_TAKE1("TraceContextReplaceUniqueID",
+                  trace_context_cmd_replace_unique_id,
+                  NULL,
+                  OR_FILEINFO,
+                  "Replace UNIQUE_ID with trace context values: off, on, trace-id, parent-id, both"),
     AP_INIT_TAKE1("TraceContextRequestHeaders",
                   trace_context_cmd_request_headers,
                   NULL,
@@ -1305,14 +1526,13 @@ static const command_rec trace_context_cmds[] = {
     { NULL }
 };
 
-/* Register module hooks for request processing and log token setup. */
+/* Register module hooks for request processing. */
 static void trace_context_register_hooks(apr_pool_t *p)
 {
     static const char *const pre[] = { "mod_unique_id.c", NULL };
 
     (void)p;
 
-    ap_hook_pre_config(trace_context_pre_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_post_read_request(trace_context_post_read_request, pre, NULL, APR_HOOK_MIDDLE);
     ap_hook_fixups(trace_context_fixups, NULL, NULL, APR_HOOK_MIDDLE);
 }

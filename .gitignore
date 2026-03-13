@@ -22,6 +22,10 @@ assets/igit.bash
 *.xdv
 
 # Apache module development
-.libs/
-*.so
+*.la
+*.la
+*.lo
 *.o
+*.slo
+*.so
+.libs/
