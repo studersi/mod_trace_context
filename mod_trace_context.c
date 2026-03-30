@@ -1,5 +1,5 @@
 /*
- * Copyright 2026 Your Name
+ * Copyright 2026 Simon Studer
  * SPDX-License-Identifier: Apache-2.0
  */
 
