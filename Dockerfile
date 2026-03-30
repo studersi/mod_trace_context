@@ -3,7 +3,10 @@ FROM httpd:2.4-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         libapr1-dev \
-        libaprutil1-dev
+        libaprutil1-dev \
+        libssl-dev \
+        ssl-cert && \
+    make-ssl-cert generate-default-snakeoil --force-overwrite
 
 COPY . /usr/src/mod_trace_context
 
