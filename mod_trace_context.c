@@ -30,6 +30,7 @@ module AP_MODULE_DECLARE_DATA trace_context_module;
 #define TRACE_CONTEXT_TRACESTATE_MEMBER_MAX_LEN 256
 #define TRACE_CONTEXT_TRACESTATE_MEMBER_NAME_MAX_LEN (TRACE_CONTEXT_TRACESTATE_MEMBER_MAX_LEN - 1)
 #define TRACE_CONTEXT_DEFAULT_TRACESTATE_MEMBER_NAME "apache"
+#define TRACE_CONTEXT_RANDOM_MAX_RETRIES 3
 #define TRACE_CONTEXT_NOTE_TRACE_ID "tc-trace-id"
 #define TRACE_CONTEXT_NOTE_PARENT_ID "tc-parent-id"
 #define TRACE_CONTEXT_NOTE_TRACEPARENT "tc-traceparent"
@@ -246,6 +247,7 @@ static int trace_context_random_trace_id(char trace_id[TRACE_CONTEXT_TRACE_ID_LE
 {
     unsigned char raw[16];
     apr_status_t rv;
+    int attempts = 0;
 
     do {
         rv = apr_generate_random_bytes(raw, sizeof(raw));
@@ -253,6 +255,9 @@ static int trace_context_random_trace_id(char trace_id[TRACE_CONTEXT_TRACE_ID_LE
             return 0;
         }
         trace_context_hex_encode(trace_id, raw, sizeof(raw));
+        if (++attempts > TRACE_CONTEXT_RANDOM_MAX_RETRIES) {
+            return 0;
+        }
     } while (trace_context_all_zeros(trace_id, TRACE_CONTEXT_TRACE_ID_LEN));
 
     return 1;
@@ -263,6 +268,7 @@ static int trace_context_random_parent_id(char parent_id[TRACE_CONTEXT_PARENT_ID
 {
     unsigned char raw[8];
     apr_status_t rv;
+    int attempts = 0;
 
     do {
         rv = apr_generate_random_bytes(raw, sizeof(raw));
@@ -270,6 +276,9 @@ static int trace_context_random_parent_id(char parent_id[TRACE_CONTEXT_PARENT_ID
             return 0;
         }
         trace_context_hex_encode(parent_id, raw, sizeof(raw));
+        if (++attempts > TRACE_CONTEXT_RANDOM_MAX_RETRIES) {
+            return 0;
+        }
     } while (trace_context_all_zeros(parent_id, TRACE_CONTEXT_PARENT_ID_LEN));
 
     return 1;
@@ -282,9 +291,15 @@ static int trace_context_parse_traceparent(const char *value,
                                            unsigned int *trace_flags)
 {
     apr_size_t i;
+    apr_size_t len;
     unsigned int version;
 
-    if (value == NULL || strlen(value) != TRACE_CONTEXT_TRACEPARENT_LEN) {
+    if (value == NULL) {
+        return 0;
+    }
+
+    len = strlen(value);
+    if (len < TRACE_CONTEXT_TRACEPARENT_LEN) {
         return 0;
     }
 
@@ -299,9 +314,19 @@ static int trace_context_parse_traceparent(const char *value,
         return 0;
     }
 
-    if (!trace_context_hex_byte(value, &version) ||
-        version != TRACE_CONTEXT_SUPPORTED_VERSION) {
+    if (!trace_context_hex_byte(value, &version)) {
         return 0;
+    }
+
+    if (version == TRACE_CONTEXT_SUPPORTED_VERSION) {
+        if (len != TRACE_CONTEXT_TRACEPARENT_LEN) {
+            return 0;
+        }
+    }
+    else {
+        if (len <= TRACE_CONTEXT_TRACEPARENT_LEN || value[55] != '-') {
+            return 0;
+        }
     }
 
     for (i = 3; i < 35; ++i) {
@@ -900,6 +925,10 @@ static int trace_context_init_new_ctx(request_rec *r,
                       "mod_trace_context: continuing incoming traceparent=%s",
                       traceparent);
         if (tracestate != NULL && tracestate[0] != '\0') {
+            if (strlen(tracestate) > TRACE_CONTEXT_TRACESTATE_MAX_LEN) {
+                ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                              "mod_trace_context: incoming tracestate exceeds max length, will be truncated during rebuild");
+            }
             ctx->tracestate = apr_pstrdup(r->pool, tracestate);
             ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
                           "mod_trace_context: accepted incoming tracestate");
@@ -923,9 +952,16 @@ static int trace_context_init_new_ctx(request_rec *r,
                           "mod_trace_context: no incoming traceparent provided");
         }
 
+        if (has_incoming_traceparent) {
+            apr_table_unset(r->headers_in, "traceparent");
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "mod_trace_context: removed stale incoming traceparent header");
+        }
+
         if (tracestate != NULL && tracestate[0] != '\0') {
-            ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, r,
-                          "mod_trace_context: ignoring incoming tracestate because a new trace is started");
+            apr_table_unset(r->headers_in, "tracestate");
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE2, 0, r,
+                          "mod_trace_context: removed stale incoming tracestate header");
         }
 
         ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
